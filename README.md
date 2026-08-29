@@ -11,8 +11,6 @@ AlphaFold 3 昇腾 NPU 推理部署（xfold PyTorch 实现 + torch_npu）。
 在 Atlas 800I A2 / A3 上从零拉起 OpenAI 兼容推理服务的端到端流程。
 
 > 本文档面向部署人员，按章节顺序执行即可完成部署。
-> 技术选型、代码改动明细见 `AF3_NPU_code_change_requirements.md`
-> 与 `deliverables/README.md`。
 
 ---
 
