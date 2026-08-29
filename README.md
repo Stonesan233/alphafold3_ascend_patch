@@ -1,3 +1,10 @@
+---
+license: apache-2.0
+library_name: pytorch
+language:
+  - zh
+hardware: NPU
+---
 # alphafold3-ascend 部署指南
 
 AlphaFold 3 昇腾 NPU 推理部署（xfold PyTorch 实现 + torch_npu）。
