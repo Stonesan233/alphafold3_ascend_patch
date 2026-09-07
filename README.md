@@ -494,7 +494,7 @@ RMSD 采用 **Kabsch 算法对齐后计算**（消除平移/旋转差异）：
 
 ### 9.4 精度回归操作
 
-内网环境可直接用 `/predict/test` 端点（内置 test pkl）对比基线：
+可直接用 `/predict/test` 端点（内置 test pkl）对比基线：
 
 ```bash
 curl -s -X POST http://localhost:9800/predict/test \
