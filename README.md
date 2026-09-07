@@ -423,11 +423,11 @@ print(resp.choices[0].message.content)"
 | 已验证环境 | A3-syn-31，NPU 4，EulerOS 宿主机 |
 | 历史验证环境 | 189 开发机（v0.18.0rc1 镜像，Python 3.11 / torch 2.9），精度基线同 |
 
-> 精度基线：`contact_probs` 与 JAX 参考输出均值差 ~0.0011（权重转换正确性）；
-> fp32 推理优于 bf16（更快且置信度更好，昇腾实测）。
 
 ## 九、精度测试
-TODO
+
+> 精度基线：`contact_probs` 与 JAX 参考输出均值差 ~0.0011（权重转换正确性），JAX格式使用CPU跑，待对比GPU跑JAX；
+> fp32 推理优于 bf16（更快且置信度更好，昇腾实测）。
 
 ## 十、性能测试
 TODO
