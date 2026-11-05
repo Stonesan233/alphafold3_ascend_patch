@@ -5,78 +5,186 @@ language:
   - zh
 hardware: NPU
 ---
-# alphafold3-ascend 部署指南
+# AlphaFold3-Ascend
 
-AlphaFold 3 昇腾 NPU 推理部署（xfold PyTorch 实现 + torch_npu）。
-在 Atlas 800I A2 / A3 上从零拉起 OpenAI 兼容推理服务的端到端流程。
+AlphaFold 3 在昇腾 NPU 上的推理适配，**以补丁形式叠加在上游代码之上**：本仓不含
+Alphafold3 与 xfold 的完整源码，只放补丁、依赖下载脚本、测试与文档，因此可以跟随
+上游演进，而不必维护一份分叉副本。
 
-> 本文档面向部署人员，按章节顺序执行即可完成部署。
+- 上游 1：`google-deepmind/alphafold3` @ `c0f97ed`（v3.0.4 + 16 提交）——数据管线与 C++ 扩展
+- 上游 2：`shenggan/xfold` @ `22bdeed`——AlphaFold 3 的 PyTorch 实现，模型前向
+- 本仓：`patches/`（2 个主补丁 + 2 个依赖补丁）、`deps/`（下载脚本）、`test/`、`docs/`
 
----
+# 目录
 
-## 一、数据与权重下载（代码之外）
+- [AlphaFold3-Ascend](#alphafold3-ascend)
+- [目录](#目录)
+- [简介](#简介)
+  - [模型介绍](#模型介绍)
+  - [代码实现](#代码实现)
+- [准备运行环境](#准备运行环境)
+  - [安装昇腾环境](#安装昇腾环境)
+  - [安装模型环境](#安装模型环境)
+- [获取上游代码并打补丁](#获取上游代码并打补丁)
+- [准备模型权重与数据](#准备模型权重与数据)
+- [快速开始](#快速开始)
+  - [设备检查](#设备检查)
+  - [编译 C++ 扩展](#编译-c-扩展)
+  - [生成 CCD pickle](#生成-ccd-pickle)
+  - [批处理推理](#批处理推理)
+  - [精度回归](#精度回归)
+- [版本说明](#版本说明)
+  - [变更](#变更)
+  - [基线升级](#基线升级)
+  - [FAQ](#faq)
+- [许可](#许可)
 
-以下文件不属于代码仓，需单独获取并放置到部署机的数据目录
-（下文以 `/mnt/weight/alphafold3` 为例，可按实际调整）。
+# 简介
 
-### 1.1 模型权重
+## 模型介绍
 
-| 文件 | 下载地址 | 大小 | 放置位置 |
-|------|----------|------|----------|
-| af3.bin.zst | https://storage.googleapis.com/alphafold3/af3.bin.zst | 1.02 GB | `/mnt/weight/alphafold3/af3.bin.zst` |
-| fourier_weight.npy | 由 alphafold3-decoded 项目提供（`data/params/diff_fourier_weight.pt` 转换） | 1.2 KB | `/mnt/weight/alphafold3/fourier_weight.npy` |
-| fourier_bias.npy | 同上（`diff_fourier_bias.pt` 转换） | 1.2 KB | `/mnt/weight/alphafold3/fourier_bias.npy` |
+AlphaFold 3 是 DeepMind 的蛋白结构预测模型，输入氨基酸/核酸序列与配体，输出复合物
+三维结构与置信度（pLDDT、PAE、PDE）。官方实现基于 JAX；`xfold` 是社区的 PyTorch
+重实现，本仓的 NPU 适配即建立在 `xfold` 之上——模型结构、权重与数值语义都不变，
+只把设备、精度、算子实现换成昇腾可用的路径。
 
-说明：
-- 权重受 [AlphaFold 3 模型参数使用条款](alphafold3/WEIGHTS_TERMS_OF_USE.md) 约束，
-  需从 Google 官方渠道获取。
-- 服务支持 `af3.bin`（解压后）与 `af3.bin.zst`（原始压缩）两种格式自动检测，
-  二选一即可，推荐直接使用原始 `.zst`。
-- fourier 两个 npy 文件很小，随数据包分发即可。
+单次推理（150 tokens，官方配置 10 recycle / 5 sample / 200 diffusion step）在
+Ascend 910B4 上约 80 s；冒烟配置（1/1/10）约 1.1 s。
 
-### 1.2 CCD 化学组件字典
+## 代码实现
 
-| 文件 | 下载地址 | 大小 | 放置位置 |
-|------|----------|------|----------|
-| components.cif.gz | https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz | 118 MB（解压 514 MB） | 解压后放 `/mnt/weight/alphafold3/components.cif` |
+适配遵循**最小改动**原则，全部改动落在 9 个文件上，不改模型结构与数值逻辑：
 
-用于生成 CCD pickle（数据管线必需，见第四章 4.3 节）。
+| 补丁 | 文件 | 改动 |
+| --- | --- | --- |
+| `alphafold3-c0f97ed-ascend.patch` | `CMakeLists.txt` | 5 个依赖支持 `ALPHAFOLD3_DEPS_DIR` 离线源码；4 个 `FORCE` 开关关掉构建期联网（Catch2 / CCD 下载）；`Boost::regex` 显式查找（>= 1.74）并链接 |
+| 同上 | `pyproject.toml` | `requires-python >= 3.11`（现场 Python 3.11/3.12）；`jax[cuda12]` 从必装改为可选 extra `cuda`，避免拖 3 GB 无用 CUDA 包 |
+| `xfold-22bdeed-ascend.patch` | `run_alphafold.py` | 设备抽象（NPU > CUDA > CPU，`AF3_DEVICE` 覆盖）；fp64→fp32（`aclnnMatmul` 不支持 double）；`--precision {auto,fp32,bf16}`；`--num_recycles` / `--diffusion_steps`；迁移到 alphafold3 3.0.4 的 `model.ModelResult` / `InferenceResult` |
+| 同上 | `xfold/params.py` | zstd 可选；自动识别 `af3.bin` / `af3.bin.zst`；fourier npy 缺失时给明确报错 |
+| 同上 | `xfold/fastnn/{attention,config,gated_linear_unit,layer_norm}.py` | triton 可选导入 + 纯 torch 回退；无 CUDA 时自动选 torch 实现 |
+| 同上 | `pyproject.toml` | 声明 `jax` / `dm-haiku` / `tokamax` 运行依赖 |
 
-### 1.3 遗传数据库（完整数据管线需要）
+依赖侧另有两个补丁（详见 [`deps/README.md`](deps/README.md)）：libcifpp 的 Boost 1.74
+与 eigen 本地路径、dssp 的 `DSSP_BUILD_MKDSSP` 开关。
 
-数据源均为 Google 镜像：
-`https://storage.googleapis.com/alphafold-databases/v3.0/`
+补丁的基线 SHA、应用顺序与每处改动的原因见 [`patches/README.md`](patches/README.md)。
 
-| 文件 | 大小（解压后） | 用途 |
-|------|---------------|------|
-| pdb_2022_09_28_mmcif_files.tar.zst | ~238 GB（19.6 万个 cif） | 模板结构 |
-| uniref90_2022_05.fa | 67 GB | 蛋白 MSA |
-| bfd-first_non_consensus_sequences.fasta | 17 GB | 蛋白 MSA |
-| mgy_clusters_2022_05.fa | 120 GB | 蛋白 MSA |
-| uniprot_all_2021_04.fa | 101 GB | 配对 MSA |
-| nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta | 75 GB | RNA MSA |
-| rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta | 0.2 GB | RNA MSA |
-| rnacentral_active_seq_id_90_cov_80_linclust.fasta | 13 GB | RNA MSA |
-| pdb_seqres_2022_09_28.fasta | 0.2 GB | 模板序列 |
+# 准备运行环境
 
-总下载量约 143 GB，解压后约 630 GB。统一放置到
-`/mnt/weight/alphafold3/databases/`（mmcif 解压到其下 `mmcif_files/`）。
+## 安装昇腾环境
 
-> 数据库仅需跑完整数据管线（输入氨基酸序列 → MSA/模板搜索 → 特征化）时使用。
-> 若只做预特征化 pkl 的推理验证，可暂不准备。
+请参考昇腾社区《[PyTorch 框架环境准备](https://www.hiascend.com/document/detail/zh/Pytorch/latest/installguide/swinstall/docs/zh/installation_guide)》。
+本仓已支持表 1 中的软件版本。
 
-### 1.4 目标目录结构
+**表 1** 昇腾软件版本支持表
 
-全部就位后：
+|  软件类型  |    首次支持版本     |
+| :--------: | :-----------------: |
+|  TorchNPU  |    2.10.0.post4     |
+|    CANN    |        9.1.0        |
+
+已验证硬件为 Atlas 800I A2（Ascend 910B4，32 GB HBM，单卡），A2 / A3 均可运行。
+设备节点编号因机型而异，`npu-smi info` 里可能是 NPU 4、对应 `/dev/davinci4`，以实际为准。
+
+## 安装模型环境
+
+**表 2** 版本支持表
+
+|     三方库      |   支持版本   |
+| :-------------: | :----------: |
+|     Python      | 3.11 / 3.12  |
+|     PyTorch     | 2.10.0+cpu   |
+|       jax       |    0.10.2    |
+|    dm-haiku     |    0.0.17    |
+|     tokamax     |    0.0.12    |
+|      rdkit      |   2025.9.4   |
+
+0. 激活 CANN 环境
+
+   ```bash
+   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+   ```
+
+1. 安装昇腾版 PyTorch 与 TorchNPU
+
+   二者版本必须严格对应，且需 `--no-deps` 安装，避免被 PyPI 的 CPU 版覆盖：
+
+   ```bash
+   pip install --no-deps torch-2.10.0+cpu-*.whl torchvision-0.25.0+cpu-*.whl torch_npu-2.10.0.post4-*.whl
+   ```
+
+2. 安装业务依赖
+
+   ```bash
+   pip install -r requirements.txt
+   pip install tokamax==0.0.12     # >=0.1.0 移除了 DotProductAttentionImplementation，会破坏 import
+   ```
+
+3. 系统包（编译 C++ 扩展需要）
+
+   ```bash
+   apt-get install -y libboost-regex-dev cmake ninja-build python3-dev
+   pip install scikit_build_core    # --no-build-isolation 下需手动装 build backend
+   ```
+
+# 获取上游代码并打补丁
+
+一条命令重建工作区（推荐）：
+
+```bash
+git clone <本仓地址> AlphaFold3-ascend
+./AlphaFold3-ascend/scripts/bootstrap_workspace.sh /data/af3 --deps
+```
+
+脚本会完成：clone `alphafold3@c0f97ed`、`xfold@22bdeed` → `git apply` 两个补丁 →
+`deps/download_deps.sh` 下载 7 个构建期依赖。需要代理时加 `--proxy http://127.0.0.1:7890`，
+内网镜像用 `--af3-git` / `--xfold-git` 指定。
+
+手工等价步骤：
+
+```bash
+export WS=/data/af3 && mkdir -p $WS && cd $WS
+git clone https://github.com/google-deepmind/alphafold3.git
+git clone https://github.com/shenggan/xfold.git
+git -C alphafold3 checkout c0f97ed
+git -C xfold      checkout 22bdeed
+
+git -C alphafold3 apply /path/AlphaFold3-ascend/patches/alphafold3-c0f97ed-ascend.patch
+git -C xfold      apply /path/AlphaFold3-ascend/patches/xfold-22bdeed-ascend.patch
+
+AlphaFold3-ascend/deps/download_deps.sh --dest $WS/deps
+```
+
+校验：
+
+```bash
+./AlphaFold3-ascend/scripts/verify_workspace.sh $WS
+```
+
+# 准备模型权重与数据
+
+以下文件不属于代码仓，需单独获取（下以 `/mnt/weight/alphafold3` 为例）：
+
+| 文件 | 来源 | 大小 |
+| --- | --- | --- |
+| `af3.bin.zst` | https://storage.googleapis.com/alphafold3/af3.bin.zst | 1.02 GB |
+| `fourier_weight.npy` / `fourier_bias.npy` | 由 alphafold3-decoded 的 `diff_fourier_weight.pt` / `diff_fourier_bias.pt` 转换 | 1.2 KB ×2 |
+| `components.cif` | https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz（解压） | 118 MB → 514 MB |
+| 遗传数据库 | https://storage.googleapis.com/alphafold-databases/v3.0/（9 个文件，约 143 GB） | 解压约 630 GB |
+
+权重受 [WEIGHTS_TERMS_OF_USE.md](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md) 约束，
+需从 Google 官方渠道获取。数据库仅完整数据管线（序列 → MSA/模板）需要；只跑预特征化
+输入的推理可暂不准备。
+
+目录结构：
 
 ```text
 /mnt/weight/alphafold3/
-├── alphafold3-ascend/          # 本仓库代码（git clone / 解压）
-├── af3.bin.zst                 # 模型权重
+├── af3.bin.zst
 ├── fourier_weight.npy
 ├── fourier_bias.npy
-├── components.cif              # CCD 字典（514 MB）
-└── databases/                  # 遗传数据库
+├── components.cif          # 514 MB，非空
+└── databases/
     ├── mmcif_files/
     ├── uniref90_2022_05.fa
     ├── bfd-first_non_consensus_sequences.fasta
@@ -88,431 +196,176 @@ AlphaFold 3 昇腾 NPU 推理部署（xfold PyTorch 实现 + torch_npu）。
     └── pdb_seqres_2022_09_28.fasta
 ```
 
----
+# 快速开始
 
-## 二、启动 Docker 容器
-
-部署使用 vllm-ascend 官方镜像（自带 CANN / torch / torch_npu）。
-以下假设使用 NPU 4（按现场空闲卡调整 `/dev/davinci4`）。
+## 设备检查
 
 ```bash
-IMAGE=quay.io/ascend/vllm-ascend:v0.23.0-a3
-CONTAINER=af3-xfold
-WEIGHT_DIR=/mnt/weight/alphafold3
-
-docker run -d \
-  --restart unless-stopped \
-  --name ${CONTAINER} \
-  --network host \
-  --shm-size 1g \
-  --privileged \
-  --device /dev/davinci4 \
-  --device /dev/davinci_manager \
-  --device /dev/devmm_svm \
-  --device /dev/hisi_hdc \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64 \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v ${WEIGHT_DIR}:${WEIGHT_DIR} \
-  --entrypoint /bin/bash \
-  ${IMAGE} \
-  -lc 'sleep infinity'
+python -c "import torch, torch_npu; print(torch.npu.is_available(), torch.npu.device_count())"
+# 预期：True 1
 ```
 
-要点：
-- `--device /dev/davinci4`：把目标卡透给容器，容器内即 `npu:0`
-- 驱动相关挂载（dcmi / npu-smi / driver/lib64）缺一会报
-  `libascend_hal.so not found`
-- 权重目录整目录挂载，代码、权重、数据库容器内均可见
-
-进入容器并验证 NPU：
+## 编译 C++ 扩展
 
 ```bash
-docker exec -it ${CONTAINER} bash
+cd $WS
 
-python3 -c "
-import torch, torch_npu
-print('torch:', torch.__version__)
-print('torch_npu:', torch_npu.__version__)
-print('NPU available:', torch.npu.is_available())
-"
-# 预期：NPU available: True（LD_PRELOAD 警告可忽略）
-
-npu-smi info   # 应只可见挂载的 NPU 4
-```
-
----
-
-## 三、安装依赖与编译 C++ 扩展
-
-### 3.1 系统包
-
-```bash
-# 编译依赖（Boost 用系统 1.74 即可）
-apt-get install -y libboost-regex-dev cmake ninja-build python3-dev
-```
-
-> apt 源按客户现场内源镜像自行配置（aarch64 平台对应 ubuntu-ports 路径）。
-
-### 3.2 Python 依赖
-
-```bash
-# 运行依赖。注意：tokamax 必须钉 0.0.12，
-# >=0.1.0 移除了 DotProductAttentionImplementation，会破坏 import
-pip install fastapi uvicorn pydantic zstandard rdkit etils absl-py tqdm
-pip install tokamax==0.0.12
-```
-
-> pip 源按客户现场内源镜像自行配置（`~/.pip/pip.conf` 或
-> `pip install -i <镜像地址>`）。
-
-### 3.3 安装 xfold
-
-```bash
-# 代码目录由宿主机用户 clone，容器内 git 因属主不一致会报
-# "dubious ownership"（xfold 版本号经 setuptools_scm 读 git，必须先加白名单）
-git config --global --add safe.directory /mnt/weight/alphafold3/alphafold3-ascend
-
-cd /mnt/weight/alphafold3/alphafold3-ascend/xfold
-pip install -e . --no-build-isolation
-```
-
-（会连带安装 jax / dm-haiku 的 CPU 版，NPU 环境不会拉 CUDA 包）
-
-### 3.4 编译 alphafold3 C++ 扩展（离线编译）
-
-```bash
-cd /mnt/weight/alphafold3/alphafold3-ascend
-
-# build backend（--no-build-isolation 模式下需手动安装，否则报
-# "Cannot import 'scikit_build_core.build'"）
-pip install scikit_build_core
-
-# 依赖源码已预打补丁在 deps/ 目录，无需任何手工 patch。
-# 唯一前置操作：预放置 CCD 文件（必须非空，空文件会被 libcifpp 删除重下）
+# CCD 字典必须预放置且非空，空文件会被 libcifpp 删除并尝试重新下载
 cp /mnt/weight/alphafold3/components.cif deps/libcifpp/rsrc/components.cif
-ls -lh deps/libcifpp/rsrc/components.cif   # 应约 514MB，禁止 0 字节
+ls -lh deps/libcifpp/rsrc/components.cif          # 应约 514 MB
 
-# 设置离线依赖目录。
-# 变量名是 ALPHAFOLD3_DEPS_DIR（敲成 ALPHAFAFOLD3 会静默走在线下载，
-# 顶层 CMake 对空值有 WARNING 兜底）
-export ALPHAFOLD3_DEPS_DIR=$PWD/deps
+export ALPHAFOLD3_DEPS_DIR=$WS/deps
+export LIBCIFPP_DATA_DIR=$WS/deps/libcifpp/rsrc
 
 cd alphafold3
 pip install -e . --no-build-isolation \
   --config-settings="cmake.args=-DBUILD_TESTING=OFF;-DCIFPP_DOWNLOAD_CCD=OFF"
-# 顶层 CMake 已对相关开关做 OFF FORCE，--config-settings 为双保险，可省略但建议保留
+
+python -c "import alphafold3.cpp; print('OK', len([x for x in dir(alphafold3.cpp) if not x.startswith('_')]))"
+# 预期：OK 13，且无 boost undefined symbol
 ```
 
-编译约 5~15 分钟（abseil + libcifpp 全量编译，314 个编译单元）。
-
-> 注意：cpp.so 按容器 Python ABI 编译，**3.11 与 3.12 的产物不能混用**，
-> 换 Python 版本的容器必须重编。
-
-### 3.5 验收
+编译约 5~15 分钟（abseil + libcifpp 全量）。`cpp.so` 与容器 Python ABI 绑定，
+3.11 与 3.12 的产物不能混用。
 
 ```bash
-# cpp.so 运行时通过 LIBCIFPP_DATA_DIR 定位 components.cif，
-# 未设会报 "Could not find the libcifpp components.cif file"
-export LIBCIFPP_DATA_DIR=/mnt/weight/alphafold3/alphafold3-ascend/deps/libcifpp/rsrc
-
-python3 -c "import alphafold3.cpp; print('OK', [x for x in dir(alphafold3.cpp) if not x.startswith('_')])"
-# 预期：OK + 13 个子模块（cif_dict、fasta_iterator、msa_conversion 等）
-# 不得出现 boost undefined symbol；断网时不得访问 github / gitlab / wwpdb
+cd $WS/xfold && pip install -e . --no-build-isolation
 ```
 
-> `LIBCIFPP_DATA_DIR` 后续（生成 CCD pickle、跑推理服务）均需要，
-> 建议写入 `~/.bashrc` 一劳永逸。
-
----
-
-## 四、生成 CCD pickle 与权重准备
-
-### 4.1 环境变量
+## 生成 CCD pickle
 
 ```bash
-# 3.5 节已设置过；若换了 shell 会话需重新 export
-export LIBCIFPP_DATA_DIR=/mnt/weight/alphafold3/alphafold3-ascend/deps/libcifpp/rsrc
-```
-
-（后续所有 Python 操作均需要；CANN 环境容器已自带，无需额外 source）
-
-### 4.2 生成 CCD pickle（约 1~2 分钟）
-
-```bash
-cd /mnt/weight/alphafold3/alphafold3-ascend/alphafold3/src
-
+cd $WS/alphafold3/src
 python3 -c "
 from alphafold3.constants.converters.ccd_pickle_gen import main
 main(['g', '/mnt/weight/alphafold3/components.cif',
       'alphafold3/constants/converters/chemical_components.pickle'])"
 
-# 建立文件名兼容软链 + 生成 sets pickle
 ln -sf chemical_components.pickle alphafold3/constants/converters/ccd.pickle
 python3 -c "
 from alphafold3.constants.converters.chemical_component_sets_gen import main
 main(['g', 'alphafold3/constants/converters/chemical_component_sets.pickle'])"
 ```
 
-### 4.3 权重目录检查
+## 批处理推理
+
+`run_alphafold.py` 支持单文件（`--json_path`）与整目录（`--input_dir`）两种输入，
+输出写到 `--output_dir`，适合离线批量跑：
 
 ```bash
-ls -la /mnt/weight/alphafold3/af3.bin.zst \
-       /mnt/weight/alphafold3/fourier_weight.npy \
-       /mnt/weight/alphafold3/fourier_bias.npy
+cd $WS/xfold
+export AF3_DEVICE=npu:0          # 多卡机器上指定卡号
+export LIBCIFPP_DATA_DIR=$WS/deps/libcifpp/rsrc
+
+python run_alphafold.py \
+  --input_dir /data/af3_inputs \
+  --output_dir /data/af3_outputs \
+  --model_dir /mnt/weight/alphafold3 \
+  --db_dir /mnt/weight/alphafold3/databases \
+  --num_recycles 10 --num_diffusion_samples 5 --diffusion_steps 200 \
+  --precision fp32
 ```
 
-三个文件齐即可，服务启动时自动完成 Haiku → PyTorch 权重转换与加载
-（无需单独的转换步骤，约 30 秒）。
+冒烟时把参数降到 `--num_recycles 1 --num_diffusion_samples 1 --diffusion_steps 10`。
+`--precision fp32` 是昇腾上的推荐值：实测比 bf16 更快（79.8 s vs 97.4 s），
+置信度指标也更好（PAE/PDE 改善 20~46%）。
 
-### 4.4 验证数据管线（可选）
+只跑数据管线或只跑推理：
 
 ```bash
-python3 -c "
-import sys, pickle
-sys.path.insert(0, '/mnt/weight/alphafold3/alphafold3-ascend/alphafold3/src')
-with open('/mnt/weight/alphafold3/alphafold3-ascend/alphafold3/src/alphafold3/test_data/featurised_example.pkl', 'rb') as f:
-    batch = pickle.load(f)
-print('PKL loaded OK:', type(batch), len(batch))"
-# 预期：PKL loaded OK: <class 'list'> 1
+python run_alphafold.py ... --run_inference=False          # 只做 MSA/模板/特征化
+python run_alphafold.py ... --run_data_pipeline=False      # 输入已含 MSA
 ```
 
----
-
-## 五、拉起推理服务
-
-### 5.1 启动（冒烟配置）
+## 精度回归
 
 ```bash
-cd /mnt/weight/alphafold3/alphafold3-ascend/service
-
-# 路径与推理参数（冒烟用低参数，快速验证）
-export AF3_SRC=/mnt/weight/alphafold3/alphafold3-ascend/alphafold3/src
-export XFOLD_SRC=/mnt/weight/alphafold3/alphafold3-ascend/xfold
-export AF3_MODEL_DIR=/mnt/weight/alphafold3
-export LIBCIFPP_DATA_DIR=/mnt/weight/alphafold3/alphafold3-ascend/deps/libcifpp/rsrc
-export AF3_NUM_RECYCLES=1 AF3_NUM_SAMPLES=1 AF3_DIFFUSION_STEPS=10
-
-nohup python3 af3_service.py > /tmp/af3_service.log 2>&1 &
-
-# 模型加载约 30~45 秒，等待后验证
-sleep 45
+cd $WS
+python /path/AlphaFold3-ascend/test/test_npu_inference.py \
+  --af3 $WS/alphafold3 --xfold $WS/xfold \
+  --model-dir /mnt/weight/alphafold3 \
+  --precision fp32 --num-recycles 1 --diffusion-steps 10
 ```
 
-关键环境变量说明（均有默认值，完整清单见 `service/README.md`）：
+预期：`predicted_lddt_mean ≈ 83`、参数量 368,384,666、1/1/10 配置约 1.1 s。
+完整的三方精度对比见 [`docs/Ascend-910B-Perf-Precision-Report.md`](docs/Ascend-910B-Perf-Precision-Report.md)。
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `AF3_MODEL_DIR` | `/home` | 权重目录（af3.bin(.zst) + fourier npy） |
-| `AF3_PRECISION` | `fp32` | 昇腾上 fp32 比 bf16 更快、置信度更好 |
-| `AF3_NUM_RECYCLES` / `AF3_NUM_SAMPLES` / `AF3_DIFFUSION_STEPS` | 10 / 5 / 200 | 官方完整配置；冒烟可设 1/1/10 |
+# 版本说明
 
-### 5.2 切换生产配置
+## 变更
 
-冒烟通过后，去掉低参数覆盖重启即为官方完整配置
-（10 recycle / 5 sample / 200 step，150 tokens 约 80 秒/次）：
+2026.11.5：仓库改造为补丁仓——移除全量 vendored 源码（`deps/` 43 MB、`alphafold3/`
+与 `xfold/` 全树），改为 `patches/` 补丁 + `deps/download_deps.sh` 下载脚本 +
+`scripts/bootstrap_workspace.sh` 重建工作区；新增 `test/` 回归套件；README 重构，
+长步骤下沉到 `docs/`。
+2026.09.07：现场部署指导刷新（A2/A3 均验证）。
+2026.08.29：Round-2 现场修复（eigen 补齐、libmcfp 1.3.4、jax cuda extra、offline FORCE）。
+2026.08.28：首次发布，基于 alphafold3 `c0f97ed` + xfold `22bdeed` 的昇腾适配。
 
-```bash
-kill %1   # 停掉冒烟进程
-unset AF3_NUM_RECYCLES AF3_NUM_SAMPLES AF3_DIFFUSION_STEPS
-nohup python3 af3_service.py > /tmp/af3_service.log 2>&1 &
-```
+## 基线升级
 
----
+补丁绑定上游 `c0f97ed` / `22bdeed`。上游演进后补丁可能无法直接应用，按以下顺序处理：
 
-## 六、冒烟测试与验收
+1. 先确认上游是否已自带等价改动，避免重复引入：
 
-### 6.1 健康检查
+   ```bash
+   grep -n "ALPHAFOLD3_DEPS_DIR\|BUILD_TESTING\|CIFPP_CACHE_DIR" alphafold3/CMakeLists.txt
+   grep -n "jax\[cuda12\]\|requires-python" alphafold3/pyproject.toml
+   grep -n "AF3_DEVICE\|torch_npu" -r xfold --include="*.py"
+   ```
 
-```bash
-curl -s http://localhost:9800/health
-```
+   > 截至上游 `v3.0.5`，`BUILD_TESTING OFF`、`CIFPP_CACHE_DIR`、依赖改
+   > `URL + SHA256` 源包这三项**已被上游吸收**，升级时应删掉补丁里对应 hunk。
 
-预期返回：
+2. 在新基线上三方合并：
 
-```json
-{"status":"ok","model":"alphafold3-3.0.4","device":"npu:0","precision":"fp32",
- "npu_available":true,"parameters":368384666}
-```
+   ```bash
+   git checkout <新基线>
+   git checkout -b npu-adapt
+   git apply --3way /path/AlphaFold3-ascend/patches/alphafold3-c0f97ed-ascend.patch
+   git apply --3way /path/AlphaFold3-ascend/patches/xfold-22bdeed-ascend.patch
+   ```
 
-### 6.2 推理冒烟（内置测试数据）
+3. 冲突热点（已实测）：
+   - `alphafold3/CMakeLists.txt`：上游 v3.0.5 起依赖声明整段改成 `URL` + `URL_HASH`，需重写离线分支；
+   - `alphafold3/pyproject.toml`：上游仍是 `requires-python >=3.12`，且新增 `msgpack`、`rdkit 2026.3.3`；
+   - `xfold/run_alphafold.py`：上游到 `550d852` 已 +101/−25，补丁 100% 冲突，需手工 rebase；
+   - `xfold/xfold/params.py` 等 6 个文件：仅 license 头漂移，`--3way` 可自动合。
 
-```bash
-curl -s -X POST http://localhost:9800/predict/test
-```
+4. 升级后必须重跑 `test/` 全套，并在真机确认精度基线（见测试报告）。
 
-预期返回（关键指标）：
+## FAQ
 
-```json
-{"status":"success","inference_time_sec":~1.1,
- "result_summary":{"tensors":{"predicted_lddt":{"shape":[1,150,24],...},
-   "full_pae":{"shape":[1,150,150],...},...},
- "metrics":{"predicted_lddt_mean":~83.6}}
-```
+**Q：`import alphafold3.cpp` 报 boost undefined symbol？**
+A：容器缺 `libboost-regex-dev`，装上后重编。
 
-验收基线（现场实测，A3-syn-31 / NPU 4 / fp32）：
+**Q：`import alphafold3.cpp` 报 `Could not find the libcifpp components.cif file`？**
+A：`LIBCIFPP_DATA_DIR` 没设，指向 `deps/libcifpp/rsrc`。
 
-| 指标 | 基线值 |
-|------|--------|
-| cpp.so import | OK，13 个子模块，无 boost 缺符号 |
-| 冒烟推理时间（1/1/10 配置） | ~1.1 s |
-| predicted_lddt_mean | ~83.6 |
-| 参数量 | 368,384,666 |
-| 完整配置（10/5/200） | ~80 s |
+**Q：CMake configure 卡在 github.com / gitlab.com / wwpdb？**
+A：`ALPHAFOLD3_DEPS_DIR` 未设或敲错（常见多敲一个 F：`ALPHAFAFOLD3_DEPS_DIR`），
+或 `components.cif` 是 0 字节被删重下。
 
-### 6.3 OpenAI SDK 调用验证
+**Q：编译报 `'unreachable' is not a member of 'std'`？**
+A：deps 里的 libmcfp 版本不对，v2.x 需要 C++23；必须用 v1.3.4。
 
-```bash
-pip install openai
-python3 -c "
-from openai import OpenAI
-client = OpenAI(base_url='http://localhost:9800/v1', api_key='none')
-resp = client.chat.completions.create(
-    model='alphafold3-3.0.4',
-    messages=[{'role': 'user', 'content':
-        '/mnt/weight/alphafold3/alphafold3-ascend/alphafold3/src/alphafold3/test_data/featurised_example.pkl'}])
-print(resp.choices[0].message.content)"
-```
+**Q：编译报 `fatal error: Core: No such file`？**
+A：eigen 不完整，缺 `Eigen/Core` 入口或 `src/Core` 目录，用 `deps/download_deps.sh` 重下。
 
-> 服务接口接受的是**预特征化 pkl 路径**（不是原始氨基酸序列）。
-> 从序列出发的完整流程（MSA → 模板 → 特征化 → 推理）用
-> `xfold/run_alphafold.py`，需要第一章 1.3 节的数据库与 HMMER 工具。
+**Q：`pip install` 报 `Cannot import 'scikit_build_core.build'`？**
+A：`--no-build-isolation` 下 build backend 要手动装：`pip install scikit_build_core`。
 
-### 6.4 API 一览
+**Q：import tokamax 报错？**
+A：tokamax 必须钉 `0.0.12`。
 
-| 端点 | 说明 |
-|------|------|
-| `GET /health` | 服务与模型状态 |
-| `GET /v1/models` | OpenAI 模型列表 |
-| `POST /v1/chat/completions` | OpenAI 兼容；`messages[-1].content` 传预特征化 pkl 路径 |
-| `POST /predict` | `{"pkl_path": "..."}` |
-| `POST /predict/test` | 内置测试数据冒烟 |
+**Q：换了容器后 `import alphafold3.cpp` 失败？**
+A：`cpp.so` 与 Python 小版本绑定（3.11 ≠ 3.12），换容器要重编。
 
----
+其他现场问题（容器挂载、pip 源、数据库准备）见
+[`docs/Ascend-NPU-Deployment.md`](docs/Ascend-NPU-Deployment.md)。
 
-## 七、故障排查
-
-| 现象 | 原因与处理 |
-|------|-----------|
-| `libascend_hal.so not found` | 容器缺驱动挂载，检查 dmesg/npud-smi/driver/lib64 三个 -v |
-| 安装 xfold 报 `fatal: detected dubious ownership` | 容器内 git 属主与宿主机不一致；`git config --global --add safe.directory <仓库路径>`（见 3.3 节） |
-| 装 alphafold3 报 `Cannot import 'scikit_build_core.build'` | `--no-build-isolation` 下 build backend 需手动装：`pip install scikit_build_core`（见 3.4 节） |
-| pip 找不到 setuptools / 装包巨慢 | 容器内 pip 走了外网；确认 pip 源已指向客户内源镜像（`~/.pip/pip.conf`） |
-| pip 报 `--config-settings` 不存在 | 用了系统旧 pip；改用 `/usr/local/python3*/bin/pip` 或改设 `export CMAKE_ARGS="-DBUILD_TESTING=OFF"` |
-| CMake configure 阶段卡在 github.com / gitlab.com / wwpdb | `ALPHAFOLD3_DEPS_DIR` 未设或敲错（多敲了个 F），或 components.cif 是空文件被删重下 |
-| 编译报 `'unreachable' is not a member of 'std'` | deps 里的 libmcfp 版本不对（2.0.4 需 C++23）；必须用 1.3.4 |
-| 编译报 `fatal error: Core: No such file` | deps/eigen 不完整（缺 Eigen/Core 入口或 src/Core 目录）；从官方 eigen-3.4.0.zip 补齐 |
-| `import alphafold3.cpp` 报 boost undefined symbol | 容器缺 `libboost-regex-dev`；装后重编 |
-| `import alphafold3.cpp` 报 `Could not find the libcifpp components.cif file` | `LIBCIFPP_DATA_DIR` 未设；指向 `deps/libcifpp/rsrc`（见 3.5 节） |
-| 服务启动 40 秒左右退出 | 查 `/tmp/af3_service.log`；权重目录三个文件是否齐全 |
-| `NameError: ChatRequest is not defined` | af3_service.py 版本过旧（Pydantic 类在函数内），git pull 拿最新 |
-| import 报 tokamax 相关错误 | tokamax 版本不对；必须 `pip install tokamax==0.0.12` |
-| 换了容器后 import alphafold3.cpp 失败 | cpp.so 与容器 Python 小版本不匹配（3.11≠3.12）；重编 |
-
----
-
-## 八、环境参考
-
-| 组件 | 版本 |
-|------|------|
-| 硬件 | Atlas 800I A2，Ascend 910B4 |
-| 镜像 | quay.io/ascend/vllm-ascend:v0.23.0-a3（Python 3.12 / torch 2.10 / torch_npu 2.10.0.post4） |
-| 已验证环境 | A3-syn-31，NPU 4，EulerOS 宿主机 |
-| 历史验证环境 | 189 开发机（v0.18.0rc1 镜像，Python 3.11 / torch 2.9），精度基线同 |
-
-
-## 九、精度测试
-
-### 9.1 测试方法
-
-使用 alphafold3 官方 `test_data`（5tgy 蛋白+配体复合物，150 tokens）做
-**三方控制变量对比**，分离 NPU 计算精度与框架/RNG 差异：
-
-```text
-对比 1: NPU PyTorch vs JAX/GPU 参考输出   → 总差异（NPU计算 + 框架 + RNG）
-对比 2: CPU PyTorch vs NPU PyTorch        → NPU 计算精度（同框架同 seed）
-对比 3: CPU PyTorch vs JAX 参考           → 框架/RNG 差异（同 seed）
-```
-
-参考输出：`alphafold3/src/alphafold3/test_data/alphafold_run_outputs/
-run_alphafold_test_output_bucket_default.pkl`（JAX/GPU 生成，seed=1，5 samples）。
-
-RMSD 采用 **Kabsch 算法对齐后计算**（消除平移/旋转差异）：
-
-```
-1. 中心化：坐标减去各自质心
-2. SVD 分解：H = A_centered.T @ B_centered → U, S, Vt = SVD(H)
-3. 旋转矩阵：R = Vt.T @ diag(1,1,sign(det(Vt.T @ U.T))) @ U.T
-4. RMSD = sqrt(mean(sum((A_aligned - B_centered)^2, axis=1)))
-```
-
-### 9.2 测试结果（官方完整配置：10 recycles / 5 samples / 200 diffusion steps）
-
-**置信度指标**（逐元素对比，最佳匹配样本对，float32）：
-
-| 指标 | NPU vs JAX 参考 | CPU vs NPU | 评估 |
-|------|----------------|------------|------|
-| contact_probs 均值差 | **0.0010** | **0.000000** | ✅ 权重转换正确 |
-| contact_probs 最大差 | 0.060 | 0.000002 | ✅ |
-| full_pde 均值差 | **0.058** | - | ✅ |
-| full_pae 均值差 | 0.321 | 0.250 | ✅ |
-| full_pae 中位数差 | **0.108** | - | ✅ |
-| average PDE | ref 1.524 / npu 1.503（差 0.021） | - | ✅ |
-
-**3D 坐标 RMSD**（Kabsch 对齐，25 组样本两两对比）：
-
-| 对比 | RMSD | 说明 |
-|------|------|------|
-| NPU vs JAX 参考 | **14.66 Å** | 总差异 |
-| **CPU PyTorch vs NPU PyTorch**（同 seed） | **1.82 Å** | **NPU 计算精度** |
-| CPU PyTorch vs JAX 参考（同 seed） | 16.61 Å | 框架/RNG 差异 |
-
-### 9.3 结论
-
-**RMSD 差异分解**：
-
-```text
-总差异（NPU vs JAX）：    14.82 Å
-├── NPU 计算精度：         1.82 Å（12%）  ← 硬件舍入级别，可接受
-└── 框架 RNG 差异：       16.61 Å（88%）  ← PyTorch vs JAX 随机数
-                                          生成器不同导致扩散采样
-                                          轨迹不同，与 NPU 无关
-```
-
-- **权重转换完全正确**：contact_probs 是 distogram head 直接输出
-  （不经过扩散采样），均值差 0.0010 证明 Evoformer 48 层 Pairformer +
-  MSA Stack 的权重映射与前向计算全部正确
-- **NPU 计算精度良好**：同框架同 seed 下，CPU 与 NPU 的 trunk 输出
-  完全一致（差 0.000000），扩散头 Kabsch RMSD 仅 1.82 Å（同一构象，
-  仅整体朝向不同）
-- RMSD ~15Å 与 NPU 硬件无关——CPU PyTorch vs JAX 同样存在 16.61Å 差异
-- **float32 优于 bfloat16**（昇腾实测）：推理更快（79.8s vs 97.4s）
-  且置信度指标更好（PAE/PDE 改善 20~46%）
-
-### 9.4 精度回归操作
-
-可直接用 `/predict/test` 端点（内置 test pkl）对比基线：
-
-```bash
-curl -s -X POST http://localhost:9800/predict/test \
-  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['metrics'])"
-# 预期 predicted_lddt_mean ~83（浮点波动 ±0.5 内正常）
-```
-
-完整三方对比脚本与参考输出见
-`alphafold3/src/alphafold3/test_data/`（featurised_example.pkl +
-alphafold_run_outputs/）。
-
----
-
-## 十、性能测试
-TODO
-
-## 许可
+# 许可
 
 alphafold3 源码遵循 Apache License 2.0；模型参数使用受
-[WEIGHTS_TERMS_OF_USE.md](alphafold3/WEIGHTS_TERMS_OF_USE.md) 约束。
-****
+[WEIGHTS_TERMS_OF_USE.md](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
+约束。xfold 源码同样为 Apache-2.0。
