@@ -132,7 +132,7 @@ Ascend 910B4 上约 80 s；冒烟配置（1/1/10）约 1.1 s。
 一条命令重建工作区（推荐）：
 
 ```bash
-git clone <本仓地址> AlphaFold3-ascend
+git clone https://github.com/Stonesan233/alphafold3_ascend_patch.git AlphaFold3-ascend
 ./AlphaFold3-ascend/scripts/bootstrap_workspace.sh /data/af3 --deps
 ```
 
