@@ -1,0 +1,186 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6d07902..3eefa29 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -37,36 +37,93 @@ set(ABSL_PROPAGATE_CXX_STD ON)
+ # Remove support for scan deps, which is only useful when using C++ modules.
+ unset(CMAKE_CXX_SCANDEP_SOURCE)
+ 
+-FetchContent_Declare(
+-  abseil-cpp
+-  GIT_REPOSITORY https://github.com/abseil/abseil-cpp
+-  GIT_TAG d7aaad83b488fd62bd51c81ecf16cd938532cc0a # 20240116.2
+-  EXCLUDE_FROM_ALL)
+-
+-FetchContent_Declare(
+-  pybind11
+-  GIT_REPOSITORY https://github.com/pybind/pybind11
+-  GIT_TAG 2e0815278cb899b20870a67ca8205996ef47e70f # v2.12.0
+-  EXCLUDE_FROM_ALL)
+-
+-FetchContent_Declare(
+-  pybind11_abseil
+-  GIT_REPOSITORY https://github.com/pybind/pybind11_abseil
+-  GIT_TAG bddf30141f9fec8e577f515313caec45f559d319 # HEAD @ 2024-08-07
+-  EXCLUDE_FROM_ALL)
+-
+-FetchContent_Declare(
+-  cifpp
+-  GIT_REPOSITORY https://github.com/pdb-redo/libcifpp
+-  GIT_TAG ac98531a2fc8daf21131faa0c3d73766efa46180 # v7.0.3
+-  # Don't `EXCLUDE_FROM_ALL` as necessary for build_data.
+-)
+-
+-FetchContent_Declare(
+-  dssp
+-  GIT_REPOSITORY https://github.com/PDB-REDO/dssp
+-  GIT_TAG 57560472b4260dc41f457706bc45fc6ef0bc0f10 # v4.4.7
+-  EXCLUDE_FROM_ALL)
++# Pre-downloaded dependency sources for offline builds.
++# Set ALPHAFOLD3_DEPS_DIR to a directory containing:
++#   abseil-cpp/      (abseil/abseil-cpp @ d7aaad83b488fd62bd51c81ecf16cd938532cc0a)
++#   pybind11/        (pybind/pybind11 @ 2e0815278cb899b20870a67ca8205996ef47e70f, v2.12.0)
++#   pybind11_abseil/ (pybind/pybind11_abseil @ bddf30141f9fec8e577f515313caec45f559d319)
++#   libcifpp/        (pdb-redo/libcifpp @ ac98531a2fc8daf21131faa0c3d73766efa46180, v7.0.3;
++#                     pre-patched: Boost >= 1.74, eigen from ${DEPS_DIR}/eigen)
++#   dssp/            (PDB-REDO/dssp @ 57560472b4260dc41f457706bc45fc6ef0bc0f10, v4.4.7;
++#                     pre-patched: optional mkdssp, libmcfp/libcifpp from ${DEPS_DIR})
++#   eigen/           (libeigen/eigen @ 3.4.0, header-only usage)
++#   libmcfp/         (mhekkel/libmcfp @ v1.3.4, C++20-compatible; needed only
++#                     by dssp's configure stage - do NOT use v2.0.4, it needs C++23)
++# The pre-patched trees are shipped in the repository's deps/ directory and
++# in deps.tar.gz. When ALPHAFOLD3_DEPS_DIR is unset (or a dependency
++# directory is missing), the original GitHub FetchContent path is used.
++set(DEPS_DIR "$ENV{ALPHAFOLD3_DEPS_DIR}" CACHE PATH
++    "Directory containing pre-downloaded dependency sources")
++
++if(NOT DEPS_DIR)
++  message(WARNING
++    "ALPHAFOLD3_DEPS_DIR is not set - falling back to GitHub FetchContent "
++    "for all dependencies. Offline builds must export it first (watch out "
++    "for the common typo ALPHAFAFOLD3_DEPS_DIR, with an extra F).")
++endif()
++
++# Offline-safe defaults for all subprojects. FORCE keeps subprojects from
++# re-enabling these behind our back (each would hit the network: libcifpp
++# tests FetchContent Catch2 from GitHub, CCD download hits wwpdb, ...).
++set(CIFPP_DOWNLOAD_CCD OFF CACHE BOOL
++    "Do not download components.cif from wwpdb during configure" FORCE)
++set(CIFPP_INSTALL_UPDATE_SCRIPT OFF CACHE BOOL "" FORCE)
++set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
++set(DSSP_BUILD_MKDSSP OFF CACHE BOOL
++    "Build the mkdssp executable (not needed by AlphaFold3)" FORCE)
++
++if(DEPS_DIR AND EXISTS "${DEPS_DIR}/abseil-cpp")
++  FetchContent_Declare(abseil-cpp SOURCE_DIR "${DEPS_DIR}/abseil-cpp")
++else()
++  FetchContent_Declare(
++    abseil-cpp
++    GIT_REPOSITORY https://github.com/abseil/abseil-cpp
++    GIT_TAG d7aaad83b488fd62bd51c81ecf16cd938532cc0a # 20240116.2
++    EXCLUDE_FROM_ALL)
++endif()
++
++if(DEPS_DIR AND EXISTS "${DEPS_DIR}/pybind11")
++  FetchContent_Declare(pybind11 SOURCE_DIR "${DEPS_DIR}/pybind11")
++else()
++  FetchContent_Declare(
++    pybind11
++    GIT_REPOSITORY https://github.com/pybind/pybind11
++    GIT_TAG 2e0815278cb899b20870a67ca8205996ef47e70f # v2.12.0
++    EXCLUDE_FROM_ALL)
++endif()
++
++if(DEPS_DIR AND EXISTS "${DEPS_DIR}/pybind11_abseil")
++  FetchContent_Declare(pybind11_abseil SOURCE_DIR "${DEPS_DIR}/pybind11_abseil")
++else()
++  FetchContent_Declare(
++    pybind11_abseil
++    GIT_REPOSITORY https://github.com/pybind/pybind11_abseil
++    GIT_TAG bddf30141f9fec8e577f515313caec45f559d319 # HEAD @ 2024-08-07
++    EXCLUDE_FROM_ALL)
++endif()
++
++# Note: the FetchContent name is `cifpp` but the local dependency directory
++# must be named `libcifpp` (matching the upstream repository name).
++if(DEPS_DIR AND EXISTS "${DEPS_DIR}/libcifpp")
++  FetchContent_Declare(cifpp SOURCE_DIR "${DEPS_DIR}/libcifpp")
++else()
++  FetchContent_Declare(
++    cifpp
++    GIT_REPOSITORY https://github.com/pdb-redo/libcifpp
++    GIT_TAG ac98531a2fc8daf21131faa0c3d73766efa46180 # v7.0.3
++    # Don't `EXCLUDE_FROM_ALL` as necessary for build_data.
++  )
++endif()
++
++if(DEPS_DIR AND EXISTS "${DEPS_DIR}/dssp")
++  FetchContent_Declare(dssp SOURCE_DIR "${DEPS_DIR}/dssp")
++else()
++  FetchContent_Declare(
++    dssp
++    GIT_REPOSITORY https://github.com/PDB-REDO/dssp
++    GIT_TAG 57560472b4260dc41f457706bc45fc6ef0bc0f10 # v4.4.7
++    EXCLUDE_FROM_ALL)
++endif()
+ 
+ FetchContent_MakeAvailable(pybind11 abseil-cpp pybind11_abseil cifpp dssp)
+ 
+@@ -75,6 +132,11 @@ find_package(
+   COMPONENTS Interpreter Development NumPy
+   REQUIRED)
+ 
++# libcifpp uses boost::regex; without this link the built cpp module fails to
++# import with `undefined symbol: _ZN5boost16re_detail...verify_optionsE...`.
++# Needs the system package libboost-regex-dev (>= 1.74).
++find_package(Boost 1.74 REQUIRED COMPONENTS regex)
++
+ include_directories(${PYTHON_INCLUDE_DIRS})
+ include_directories(src/)
+ 
+@@ -97,7 +159,8 @@ target_link_libraries(
+           pybind11_abseil::absl_casters
+           Python3::NumPy
+           dssp::dssp
+-          cifpp::cifpp)
++          cifpp::cifpp
++          Boost::regex)
+ 
+ target_compile_definitions(cpp PRIVATE VERSION_INFO=${PROJECT_VERSION})
+ install(TARGETS cpp LIBRARY DESTINATION alphafold3)
+diff --git a/pyproject.toml b/pyproject.toml
+index 1ca2376..e785634 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -11,15 +11,17 @@ build-backend = "scikit_build_core.build"
+ [project]
+ name = "alphafold3"
+ dynamic = ["version"]
+-requires-python = ">=3.12"
++requires-python = ">=3.11"
+ readme = "README.md"
+ license = {file = "LICENSE"}
+ dependencies = [
+     "absl-py>=2.3.1",
+     "dm-haiku==0.0.17",
+     "etils[epath]",
+-    "jax==0.10.2",
+-    "jax[cuda12]==0.10.2; sys_platform != 'darwin'",
++    # Plain jax only (CPU/NPU); the CUDA extra would pull ~3GB of NVIDIA
++    # wheels that are useless on Ascend. Use `pip install -e ".[cuda]"` on
++    # real GPU machines instead.
++    "jax==0.10.2; sys_platform != 'darwin'",
+     "jax-mps==0.10.9; sys_platform == 'darwin' and platform_machine == 'arm64'",
+     "numpy",
+     "rdkit==2025.9.4",
+@@ -29,6 +31,10 @@ dependencies = [
+ ]
+ 
+ [project.optional-dependencies]
++cuda = [
++  # Opt-in CUDA 12 support for NVIDIA GPU machines.
++  "jax[cuda12]==0.10.2; sys_platform != 'darwin'",
++]
+ gcsfs = [
+   # Use `uv sync --extra gcsfs` to enable GCS paths for inputs and outputs
+   "gcsfs",
