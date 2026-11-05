@@ -2,20 +2,32 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 
-# Build artifacts
+# 构建产物
 build/
 dist/
 _skbuild/
 CMakeFiles/
 cmake-build-*/
+_deps/
+*.so
 
-# Editors / OS
+# 依赖源码（deps/download_deps.sh 的产物，不入库）
+deps/src/
+deps/.cache/
+deps.tar.gz
+
+# 需要从 wwpdb 单独下载的 CCD 字典（514MB）
+deps/libcifpp/rsrc/components.cif
+
+# 由 build_data / ccd_pickle_gen 生成的 pickle（数百 MB）
+alphafold3/src/alphafold3/constants/converters/chemical_components.pickle
+alphafold3/src/alphafold3/constants/converters/chemical_component_sets.pickle
+
+# 编辑器 / OS
 .idea/
 .vscode/
 .DS_Store
-
-# Offline dependency bundle (regenerate with: tar czf deps.tar.gz deps)
-deps.tar.gz

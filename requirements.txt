@@ -1,0 +1,31 @@
+# AlphaFold3 昇腾推理依赖清单
+# Python 3.11 / 3.12
+#
+# torch / torchvision / torch_npu 不在此列：昇腾上必须使用与 CANN 匹配的适配版 wheel，
+# 且需在本文件之前安装，否则会被 PyPI 上的 CPU 版覆盖：
+#
+#   pip install --no-deps torch-2.10.0+cpu-*.whl torchvision-0.25.0+cpu-*.whl torch_npu-2.10.0.post4-*.whl
+#
+# alphafold3 / xfold 自身的依赖（jax / dm-haiku / tokamax / rdkit / etils ...）由
+# `pip install -e .` 从各自的 pyproject.toml 装入，这里只列需要额外固定的运行期依赖。
+
+absl-py>=2.3.1
+etils[epath]
+numpy
+tqdm
+zstandard
+
+# rdkit 版本与 alphafold3 3.0.4 的 pyproject 对齐
+rdkit==2025.9.4
+
+# tokamax 必须钉死：>=0.1.0 移除了 DotProductAttentionImplementation，import 即失败
+tokamax==0.0.12
+
+# jax 用 CPU 版即可（NPU 上只用于权重转换与数据管线，不做前向计算）；
+# 不要装 jax[cuda12]，会拖约 3GB 无用 CUDA 包
+jax==0.10.2
+dm-haiku==0.0.17
+
+# 性能/诊断（可选）
+# pytest>=6.0           # 跑官方 CPU 测试与 test/ 套件
+# pynvml                # 不适用 NPU，仅 CUDA 环境
