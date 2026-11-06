@@ -93,6 +93,16 @@ def run_once(args, device_spec, npz_path, af3):
     return out
 
 
+def pick(out, name):
+    """按展平后的键名取张量：distogram 子字典会变成 "<outer>/<inner>"。"""
+    if name in out:
+        return out[name]
+    for key in out:
+        if key.split("/")[-1] == name:
+            return out[key]
+    return None
+
+
 def compare_arrays(name, a, b):
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -184,8 +194,9 @@ def main():
         print("    未启用 --cpu，跳过")
     else:
         for key in ("contact_probs", "predicted_lddt", "full_pae", "full_pde"):
-            if key in out_npu and key in out_cpu:
-                compare_arrays(key, out_npu[key].numpy(), out_cpu[key].numpy())
+            a, b = pick(out_npu, key), pick(out_cpu, key)
+            if a is not None and b is not None:
+                compare_arrays(key, a.numpy(), b.numpy())
 
     if args.reference:
         print("\n== NPU vs JAX 参考（总差异）")
@@ -199,8 +210,9 @@ def main():
         num = getattr(ref0, "numerical_data", {}) or {}
         meta = getattr(ref0, "metadata", {}) or {}
         for key in REF_ARRAY_KEYS:
-            if key in num and key in out_npu:
-                ours = out_npu[key].numpy()
+            ours_t = pick(out_npu, key)
+            if key in num and ours_t is not None:
+                ours = ours_t.numpy()
                 theirs = np.asarray(num[key])
                 # 参考是 token 级，我们的可能是全 token+pad，取前 N×N
                 n = theirs.shape[-1]

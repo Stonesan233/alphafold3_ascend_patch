@@ -290,10 +290,76 @@ python /path/AlphaFold3-ascend/test/test_npu_inference.py \
 预期：`predicted_lddt_mean ≈ 83`、参数量 368,384,666、1/1/10 配置约 1.1 s。
 完整的三方精度对比见 [`docs/Ascend-910B-Perf-Precision-Report.md`](docs/Ascend-910B-Perf-Precision-Report.md)。
 
+# 部署注意事项
+
+以下都是在现场（跳板机 + 8×910B4 容器）实测踩到的问题，按出现频率排序。
+
+1. **传输规范**：优先 `git clone`。若只能打包直传（Windows SFTP / 文件复制），
+   落地后务必先规范行尾与执行位，否则 bash 会报
+   `set: pipefail: invalid option name`、`$'\r': command not found`：
+
+   ```bash
+   find . -type f \( -name '*.sh' -o -name '*.py' -o -name '*.patch' \) \
+       -exec sed -i 's/\r//g' {} +
+   chmod +x scripts/*.sh deps/*.sh test/*.sh
+   ```
+
+   仓库已提供 `.gitattributes` 强制 `*.sh/*.py/*.patch/*.md` 使用 LF。
+
+2. **没有 GitHub 直连**：跳板/沙箱里 `git clone`、`curl github.com` 可能直接 DNS 失败，
+   `bootstrap_workspace.sh` 需要带 `--proxy http://<代理>:<端口>`；内网镜像可用
+   `--af3-git` / `--xfold-git`。
+
+3. **选卡**：容器若映射了全部 8 张卡，`--device npu:0` 会落到物理 NPU 0，被其他业务
+   占满时报 `NPU out of memory`。必须显式指定空闲卡：
+
+   ```bash
+   export ASCEND_RT_VISIBLE_DEVICES=5    # 再配合 --device npu:0
+   ```
+
+4. **数据管线只需要 HMMER**：AF3 的 MSA 用 `jackhmmer`/`nhmmer`，模板用
+   `hmmsearch`/`hmmbuild`，**不需要 hh-suite，也不需要 kalign**。离线环境可源码编译：
+
+   ```bash
+   # eddylab.org 下载 hmmer-3.4.tar.gz（约 20MB）
+   ./configure --prefix=/opt/hmmer && make -j && make install
+   ```
+
+   多层 SSH 场景下 `export PATH=...:$PATH` 会被中间 shell 提前展开，建议给
+   `run_alphafold.py` 传 `--jackhmmer_binary_path` 等**绝对路径**。
+
+5. **最小推理管线**（不下载数百 GB 数据库，适合 CI/冒烟）：用上游
+   `src/alphafold3/test_data/miniature_databases/`（7 个约 1000 条的微型 FASTA +
+   `pdb_mmcif` + `pdb_seqres`）+ HMMER 二进制 + 显式 `--db_dir` 与各 binary flag。
+   注意微型库的 MSA 深度没有生产意义。
+
+6. **容器内的构建链**：离线环境需预装（走 wheel 中转）
+   `scikit_build_core`、`pybind11`、`cmake>=3.28`、`ninja`、`setuptools`；
+   `pip install -e .` 必须加 `--no-build-isolation`，否则 pip 进入隔离环境去连 PyPI。
+
+7. **运行时依赖**：`rdkit` 会把 numpy 拉到 2.x。独立容器无碍；与 vLLM 等混合部署时
+   （如 `mistral-common` 要求 `numpy<2.4`）需要钉版本。`zstandard` 是加载
+   `af3.bin.zst` 的必需依赖。
+
+8. **两阶段加载约束**：`alphafold3.cpp` 与 `torch_npu` 同进程后再对 pkl 做反序列化会
+   segfault，`pkl→npz` 必须在未加载 `torch_npu` 的干净子进程里完成
+   （`test/af3_test_utils.pkl_to_npz` 已封装，`test_*.py` 均遵守）。
+
+9. **运行时数据文件不入库**：`components.cif`（514 MB）需自行获取；
+   `chemical_components.pickle` 与 `chemical_component_sets.pickle`（约 546 MB）
+   由 bootstrap 之后手工生成，`verify_workspace.sh` 会对这三项缺失给出 WARN。
+
 # 版本说明
 
 ## 变更
 
+2026.11.6：外网验证反馈修复——`verify_workspace.sh` 在 Python < 3.10 上不再误报
+（`match` 语法），并新增 CCD pickle / components.cif 缺失的 WARN；`test_npu_inference.py`
+与 `test_precision_3way.py` 修正 `contact_probs` 键名（实际为 `distogram/contact_probs`）；
+`download_deps.sh` 显式检查 `patch(1)`；`bootstrap_workspace.sh` 的后续步骤补上生成
+CCD pickle；xfold 补丁补 `--max_template_date`（alphafold3 c0f97ed 为必填）、
+`--fastnn` 仅在 CUDA 上用 triton、`--input_dir` 的 generator 先物化；新增
+`.gitattributes` 与「部署注意事项」。
 2026.11.5：仓库改造为补丁仓——移除全量 vendored 源码（`deps/` 43 MB、`alphafold3/`
 与 `xfold/` 全树），改为 `patches/` 补丁 + `deps/download_deps.sh` 下载脚本 +
 `scripts/bootstrap_workspace.sh` 重建工作区；新增 `test/` 回归套件；README 重构，

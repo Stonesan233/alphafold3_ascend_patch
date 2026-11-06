@@ -65,8 +65,14 @@ if [[ $LIST_ONLY -eq 1 ]]; then
   exit 0
 fi
 
-for bin in curl tar sha256sum; do
-  command -v "$bin" >/dev/null || { echo "缺少命令: $bin" >&2; exit 1; }
+for bin in curl tar sha256sum patch; do
+  if ! command -v "$bin" >/dev/null; then
+    case "$bin" in
+      patch) echo "缺少命令: patch（apt-get install -y patch / yum install -y patch）" >&2 ;;
+      *)     echo "缺少命令: $bin" >&2 ;;
+    esac
+    exit 1
+  fi
 done
 
 mkdir -p "$CACHE" "$DEST"

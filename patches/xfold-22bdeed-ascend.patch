@@ -16,10 +16,18 @@ index 215f60a..2237072 100644
  
  [tool.setuptools]
 diff --git a/run_alphafold.py b/run_alphafold.py
-index c72f2bb..a400962 100644
+index c72f2bb..a150996 100644
 --- a/run_alphafold.py
 +++ b/run_alphafold.py
-@@ -41,10 +41,9 @@ import alphafold3.cpp
+@@ -24,6 +24,7 @@ import random
+ from collections.abc import Sequence
+ import csv
+ import dataclasses
++import datetime
+ import multiprocessing
+ import os
+ import pathlib
+@@ -41,10 +42,9 @@ import alphafold3.cpp
  from alphafold3.data import featurisation
  from alphafold3.data import pipeline
  from alphafold3.model import features
@@ -31,7 +39,21 @@ index c72f2bb..a400962 100644
  
  import numpy as np
  import torch
-@@ -201,6 +200,63 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
+@@ -182,6 +182,13 @@ _SEQRES_DATABASE_PATH = flags.DEFINE_string(
+ )
+ 
+ # Number of CPUs to use for MSA tools.
++_MAX_TEMPLATE_DATE = flags.DEFINE_string(
++    'max_template_date',
++    '2021-09-30',
++    'Maximum template release date, formatted as YYYY-MM-DD. Templates '
++    'released after this date are ignored.',
++)
++
+ _JACKHMMER_N_CPU = flags.DEFINE_integer(
+     'jackhmmer_n_cpu',
+     min(multiprocessing.cpu_count(), 8),
+@@ -201,6 +208,63 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
      'Number of diffusion samples to generate.',
  )
  
@@ -95,7 +117,7 @@ index c72f2bb..a400962 100644
  
  class ModelRunner:
      """Helper class to run structure prediction stages."""
-@@ -209,11 +265,17 @@ class ModelRunner:
+@@ -209,11 +273,17 @@ class ModelRunner:
          self,
          model_dir: pathlib.Path,
          device: torch.device,
@@ -114,14 +136,17 @@ index c72f2bb..a400962 100644
          self._model.eval()
          print('loading the model parameters...')
          import_jax_weights_(self._model, model_dir)
-@@ -221,14 +283,15 @@ class ModelRunner:
+@@ -221,14 +291,18 @@ class ModelRunner:
          self._model = self._model.to(device=self._device)
  
          if _USE_FASTNN.value is True:
 -            fastnn_config.layer_norm_implementation = 'triton'
 -            fastnn_config.dot_product_attention_implementation = 'triton'
 -            fastnn_config.gated_linear_unit_implementation = 'triton'
-+            fast_impl = 'triton' if fastnn_config.HAS_TRITON else 'torch'
++            # Ascend 版 triton 虽然可导入，但 kernel 依赖 grid<65536 与 CUDA
++            # 语义，NPU 上必须走纯 torch 实现。
++            use_triton = fastnn_config.HAS_TRITON and self._device.type == 'cuda'
++            fast_impl = 'triton' if use_triton else 'torch'
 +            fastnn_config.layer_norm_implementation = fast_impl
 +            fastnn_config.dot_product_attention_implementation = fast_impl
 +            fastnn_config.gated_linear_unit_implementation = fast_impl
@@ -134,7 +159,7 @@ index c72f2bb..a400962 100644
          """Computes a forward pass of the model on a featurised example."""
          featurised_example = pytree.tree_map(
              torch.from_numpy, utils.remove_invalidly_typed_feats(
-@@ -239,10 +302,21 @@ class ModelRunner:
+@@ -239,10 +313,21 @@ class ModelRunner:
              lambda x: x.to(device=self._device),
              featurised_example,
          )
@@ -157,7 +182,7 @@ index c72f2bb..a400962 100644
              result = self._model(featurised_example)
              result['__identifier__'] = self._model.__identifier__.numpy()
  
-@@ -261,12 +335,12 @@ class ModelRunner:
+@@ -261,12 +346,12 @@ class ModelRunner:
      def extract_structures(
          self,
          batch: features.BatchDict,
@@ -173,7 +198,7 @@ index c72f2bb..a400962 100644
                  batch=batch, result=result, target_name=target_name
              )
          )
-@@ -284,7 +358,7 @@ class ResultsForSeed:
+@@ -284,7 +369,7 @@ class ResultsForSeed:
      """
  
      seed: int
@@ -182,7 +207,7 @@ index c72f2bb..a400962 100644
      full_fold_input: folding_input.Input
  
  
-@@ -297,7 +371,7 @@ def predict_structure(
+@@ -297,7 +382,7 @@ def predict_structure(
  
      print(f'Featurising data for seeds {fold_input.rng_seeds}...')
      featurisation_start_time = time.time()
@@ -191,7 +216,7 @@ index c72f2bb..a400962 100644
      featurised_examples = featurisation.featurise_input(
          fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
      )
-@@ -309,7 +383,7 @@ def predict_structure(
+@@ -309,7 +394,7 @@ def predict_structure(
      all_inference_results = []
      for seed, example in zip(fold_input.rng_seeds, featurised_examples):
          print(f'Running model inference for seed {seed}...')
@@ -200,7 +225,7 @@ index c72f2bb..a400962 100644
          inference_start_time = time.time()
  
          # set the random seed for the model.
-@@ -318,7 +392,7 @@ def predict_structure(
+@@ -318,7 +403,7 @@ def predict_structure(
          np.random.seed(seed)
  
          result = model_runner.run_inference(example)
@@ -209,7 +234,16 @@ index c72f2bb..a400962 100644
          print(
              f'Running model inference for seed {seed} took '
              f' {time.time() - inference_start_time:.2f} seconds.'
-@@ -581,13 +655,14 @@ def main(_):
+@@ -573,6 +658,8 @@ def main(_):
+             ),
+             pdb_database_path=replace_db_dir(_PDB_DATABASE_PATH.value),
+             seqres_database_path=replace_db_dir(_SEQRES_DATABASE_PATH.value),
++            max_template_date=datetime.date.fromisoformat(
++                _MAX_TEMPLATE_DATE.value),
+             jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+             nhmmer_n_cpu=_NHMMER_N_CPU.value,
+         )
+@@ -581,18 +668,22 @@ def main(_):
          data_pipeline_config = None
  
      if _RUN_INFERENCE.value:
@@ -225,6 +259,14 @@ index c72f2bb..a400962 100644
          )
      else:
          print('Skipping running model inference.')
+         model_runner = None
+ 
++    # load_fold_inputs_from_* 返回 generator（alphafold3 c0f97ed），
++    # 下面既要用 len() 又要遍历，先物化成 list。
++    fold_inputs = list(fold_inputs)
+     print(f'Processing {len(fold_inputs)} fold inputs.')
+     for fold_input in fold_inputs:
+         process_fold_input(
 diff --git a/xfold/fastnn/attention.py b/xfold/fastnn/attention.py
 index 6b7814d..f7d007e 100644
 --- a/xfold/fastnn/attention.py

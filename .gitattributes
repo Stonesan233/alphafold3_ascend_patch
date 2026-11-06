@@ -1,0 +1,8 @@
+# 统一行尾，避免 Windows 直传后脚本出现 CRLF（bash 会报
+# `set: pipefail: invalid option name` / `$'\r': command not found`）
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.patch text eol=lf
+*.md    text eol=lf

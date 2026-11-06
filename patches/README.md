@@ -1,7 +1,7 @@
 # 补丁清单
 
-本仓的适配全部以补丁形式维护，**不含上游源码**。全部补丁合计改动 11 个文件、
-约 470 行（不含依赖补丁）。
+本仓的适配全部以补丁形式维护，**不含上游源码**。两个主补丁合计改动 9 个文件
+（alphafold3 +103/−34，xfold +251/−34），另有 2 个依赖补丁。
 
 ## 基线
 
@@ -35,11 +35,11 @@ git -C xfold      apply patches/xfold-22bdeed-ascend.patch
 | `CMakeLists.txt` | 5 个 `FetchContent_Declare` 增加 `ALPHAFOLD3_DEPS_DIR` + `SOURCE_DIR` 分支，缺省回落原 GitHub 路径；新增 `CIFPP_DOWNLOAD_CCD` / `CIFPP_INSTALL_UPDATE_SCRIPT` / `BUILD_TESTING` / `DSSP_BUILD_MKDSSP` 四个 `FORCE` 开关；`find_package(Boost 1.74 REQUIRED COMPONENTS regex)` 并链接 `Boost::regex` | 现场断网：libcifpp 测试会 FetchContent Catch2、CCD 会访问 wwpdb、dssp 会编 mkdssp；libcifpp 用 `boost::regex`，不显式链接则 `import alphafold3.cpp` 报 undefined symbol |
 | `pyproject.toml` | `requires-python >=3.12` → `>=3.11`；`jax[cuda12]` 改为 optional extra `cuda`，基础依赖退化为 `jax` | 现场镜像为 Python 3.11/3.12；NPU 上 `jax[cuda12]` 会拖约 3 GB 无用 CUDA 包 |
 
-### xfold-22bdeed-ascend.patch（7 文件，+235/−34）
+### xfold-22bdeed-ascend.patch（7 文件，+251/−34）
 
 | 文件 | 改动 | 原因 |
 | --- | --- | --- |
-| `run_alphafold.py` | `get_device()`（NPU > CUDA > CPU，`AF3_DEVICE` 覆盖）；`device_sync()`；featurised 输入 fp64→fp32；`--precision {auto,fp32,bf16}`；`--num_recycles` / `--diffusion_steps`；fastnn 无 triton 时回落 torch；迁移到 alphafold3 3.0.4 的 `model.ModelResult` / `InferenceResult` | `aclnnMatmul` 不支持 double；NPU 上 fp32 比 bf16 更快更准；xfold 基线写于 3.0.2 时代，3.0.4 删除了 `components.base_model` 与 `diffusion.model.Diffuser`，不改则 import 即失败 |
+| `run_alphafold.py` | `get_device()`（NPU > CUDA > CPU，`AF3_DEVICE` 覆盖）；`device_sync()`；featurised 输入 fp64→fp32；`--precision {auto,fp32,bf16}`；`--num_recycles` / `--diffusion_steps`；迁移到 alphafold3 3.0.4 的 `model.ModelResult` / `InferenceResult`；`--max_template_date`（alphafold3 `c0f97ed` 的 `DataPipelineConfig` 把它设为必填 kw-only）；`--fastnn` 仅在 CUDA 上用 triton（Ascend triton 能 import 但 kernel 依赖 `grid<65536`）；`--input_dir` 的 generator 先 `list()` 再 `len()` | `aclnnMatmul` 不支持 double；NPU 上 fp32 比 bf16 更快更准；xfold 基线写于 3.0.2 时代，3.0.4 删除了 `components.base_model` 与 `diffusion.model.Diffuser`，不改则 import 即失败 |
 | `xfold/params.py` | zstd 可选；自动识别 `af3.bin` / `af3.bin.zst`；fourier npy 缺失时报明确错误 | 现场经常拿不到解压权重；zstandard 不是必修依赖 |
 | `xfold/fastnn/attention.py` | triton 可选导入 + torch 回退 | NPU 无 triton |
 | `xfold/fastnn/config.py` | 新增 `HAS_TRITON` 探测，无 CUDA/NPU 时默认 torch | 同上 |

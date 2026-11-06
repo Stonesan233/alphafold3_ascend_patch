@@ -100,8 +100,24 @@ cat <<EOF
   xfold       $(git -C "$WS/xfold" rev-parse --short HEAD) + 补丁
 
 后续步骤（详见 README「快速开始」）：
-  export ALPHAFOLD3_DEPS_DIR=$WS/deps
-  export LIBCIFPP_DATA_DIR=$WS/deps/libcifpp/rsrc
-  cd $WS/alphafold3 && pip install -e . --no-build-isolation
-  cd $WS/xfold      && pip install -e . --no-build-isolation
+  1) CCD 字典（514 MB，不入库）：把 components.cif 放到 deps/libcifpp/rsrc/
+     cp /path/to/components.cif $WS/deps/libcifpp/rsrc/components.cif
+
+  2) 环境变量
+     export ALPHAFOLD3_DEPS_DIR=$WS/deps
+     export LIBCIFPP_DATA_DIR=$WS/deps/libcifpp/rsrc
+
+  3) 编译安装
+     cd $WS/alphafold3 && pip install -e . --no-build-isolation
+     cd $WS/xfold      && pip install -e . --no-build-isolation
+
+  4) 生成运行时必需的 CCD pickle（约 546 MB，不在 git 里，缺了会报
+     FileNotFoundError: chemical_component_sets.pickle）
+     cd $WS/alphafold3/src
+     python3 -c "from alphafold3.constants.converters.ccd_pickle_gen import main; \
+       main(['g', '$WS/deps/libcifpp/rsrc/components.cif', \
+             'alphafold3/constants/converters/chemical_components.pickle'])"
+     ln -sf chemical_components.pickle alphafold3/constants/converters/ccd.pickle
+     python3 -c "from alphafold3.constants.converters.chemical_component_sets_gen import main; \
+       main(['g', 'alphafold3/constants/converters/chemical_component_sets.pickle'])"
 EOF

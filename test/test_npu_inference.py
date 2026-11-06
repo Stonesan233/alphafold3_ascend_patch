@@ -96,7 +96,13 @@ def main():
     elapsed = time.perf_counter() - start
 
     lddt = float(out["predicted_lddt"].mean()) if "predicted_lddt" in out else float("nan")
-    contact = float(out["contact_probs"].mean()) if "contact_probs" in out else float("nan")
+    # 模型里 contact_probs 在 distogram 子字典下，run_model 展平后键名带前缀；
+    # 兼容两种命名，避免打印 nan 让人误判成输出异常。
+    contact = float("nan")
+    for key in ("distogram/contact_probs", "contact_probs"):
+        if key in out:
+            contact = float(out[key].mean())
+            break
     print(f"      predicted_lddt_mean = {lddt:.3f}")
     print(f"      contact_probs_mean   = {contact:.6f}")
     print(f"      耗时                 = {elapsed:.2f} s")
