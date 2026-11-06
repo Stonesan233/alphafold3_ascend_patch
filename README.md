@@ -366,6 +366,8 @@ A：`cpp.so` 与 Python 小版本绑定（3.11 ≠ 3.12），换容器要重编�
 
 # 许可
 
-alphafold3 源码遵循 Apache License 2.0；模型参数使用受
-[WEIGHTS_TERMS_OF_USE.md](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
-约束。xfold 源码同样为 Apache-2.0。
+本仓的补丁、脚本与文档遵循 Apache-2.0；alphafold3 与 xfold 源码同样为 Apache-2.0。
+
+**AlphaFold 3 的模型权重与推理输出不在本仓分发**，由 Google 单独授权
+（仅限非商业用途，且禁止发布或分享权重；商业使用需自行向 Google 取得授权）。
+完整边界见 [NOTICE.md](NOTICE.md)。
